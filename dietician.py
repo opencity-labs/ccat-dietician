@@ -1,4 +1,6 @@
 import hashlib
+import os
+import json
 from typing import List
 from cat.log import log
 from cat.mad_hatter.decorators import hook, plugin
@@ -52,6 +54,11 @@ class PluginSettings(BaseModel):
         default=DEFAULT_SQLITE_FILEPATH,
         title="Sqlite filepath. Change it only if you know what you are doing!",
     )
+    delete_db: bool = Field(
+        default=False,
+        title="Delete Database",
+        description="Set to True to delete the database file. This action cannot be undone.",
+    )
 
 
 @plugin
@@ -59,10 +66,77 @@ def settings_model():
     return PluginSettings
 
 
+def save_plugin_settings_to_file(settings: dict, plugin_path: str) -> dict:
+    """
+    Save plugin settings to settings.json file in the plugin directory.
+    This replicates the default save behavior from the Cat framework.
+    
+    Args:
+        settings: The settings dictionary to save
+        plugin_path: The path to the plugin directory
+        
+    Returns:
+        The updated settings dictionary, or empty dict if save failed
+    """
+    settings_file_path = os.path.join(plugin_path, "settings.json")
+    
+    # Load already saved settings (replicate load_settings behavior)
+    old_settings = {}
+    if os.path.exists(settings_file_path):
+        try:
+            with open(settings_file_path, "r") as json_file:
+                old_settings = json.load(json_file)
+        except Exception as e:
+            log.error(f"Unable to load existing settings: {e}")
+    
+    # Merge new settings with old ones
+    updated_settings = {**old_settings, **settings}
+    
+    # Save settings to file
+    try:
+        with open(settings_file_path, "w") as json_file:
+            json.dump(updated_settings, json_file, indent=4)
+        return updated_settings
+    except Exception as e:
+        log.error(f"Unable to save plugin settings: {e}")
+        return {}
+
+
+@plugin
+def save_settings(settings):
+    """Handle plugin settings save with optional database deletion."""
+    delete_db = settings.get("delete_db", False)
+    
+    if delete_db:
+        db_path = settings.get("sqlite_db_path", DEFAULT_SQLITE_FILEPATH)
+        
+        # Extract file path from SQLAlchemy connection string
+        if db_path.startswith("sqlite:///"):
+            file_path = db_path[10:]  # Remove "sqlite:///" prefix
+        else:
+            file_path = db_path
+            
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                log.info(f"Dietician: Successfully deleted database file: {file_path}")
+            else:
+                log.warning(f"Dietician: Database file does not exist: {file_path}")
+        except Exception as e:
+            log.error(f"Dietician: Failed to delete database file {file_path}: {str(e)}")
+        
+        # Reset the delete_db flag to False after attempting deletion
+        settings["delete_db"] = False
+    
+    # Save settings using the extracted function (replicates default Cat behavior)
+    plugin_path = os.path.dirname(os.path.abspath(__file__))
+    return save_plugin_settings_to_file(settings, plugin_path)
+
+
 @hook(priority=10)
 def before_rabbithole_splits_text(doc, cat):
     # doc is a list with only one element, always
-    cat.working_memory['ccat-dietician'] = {
+    cat.working_memory.ccat_dietician = {
         'name': doc[0].metadata['source'],
         'hash': hashlib.sha256(doc[0].page_content.encode()).hexdigest()
     }
@@ -79,39 +153,39 @@ def before_rabbithole_splits_text(doc, cat):
 
 @hook(priority=10)
 def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
-    cat.working_memory['ccat-dietician']['chunk_count'] = len(docs)
+    cat.working_memory.ccat_dietician['chunk_count'] = len(docs)
 
     with Session(engine) as session:
         try:
-            doc_by_name = session.query(DietDocument).filter_by(name=cat.working_memory['ccat-dietician']['name']).first()
+            doc_by_name = session.query(DietDocument).filter_by(name=cat.working_memory.ccat_dietician['name']).first()
             if doc_by_name is None:
-                doc_by_hash = session.query(DietDocument).filter_by(hash=cat.working_memory['ccat-dietician']['hash']).first()
+                doc_by_hash = session.query(DietDocument).filter_by(hash=cat.working_memory.ccat_dietician['hash']).first()
                 if doc_by_hash is None:
-                        db_doc = DietDocument(name=cat.working_memory['ccat-dietician']['name'], hash=cat.working_memory['ccat-dietician']['hash'], chunks=[Chunk(chunk_count=cat.working_memory['ccat-dietician']['chunk_count'])])
+                        db_doc = DietDocument(name=cat.working_memory.ccat_dietician['name'], hash=cat.working_memory.ccat_dietician['hash'], chunks=[Chunk(chunk_count=cat.working_memory.ccat_dietician['chunk_count'])])
                         session.add(db_doc)
                         session.commit()
                         log.info(f"Dietician is allowing the ingestion of a new document: {db_doc}")
                         return docs
                 else:
-                    if cat.working_memory['ccat-dietician']['chunk_count'] in [c.chunk_count for c in doc_by_hash.chunks]:
-                        log.info(f"Dietician detected {cat.working_memory['ccat-dietician']['name']} as a duplicate of {doc_by_hash.name}, since the number of chunks ({cat.working_memory['ccat-dietician']['chunk_count']}) coincides to what is already in declarative memory, this ingestion is going to be avoided.")
+                    if cat.working_memory.ccat_dietician['chunk_count'] in [c.chunk_count for c in doc_by_hash.chunks]:
+                        log.info(f"Dietician detected {cat.working_memory.ccat_dietician['name']} as a duplicate of {doc_by_hash.name}, since the number of chunks ({cat.working_memory.ccat_dietician['chunk_count']}) coincides to what is already in declarative memory, this ingestion is going to be avoided.")
                         return []
                     else:
-                        doc_by_hash.chunks.append(Chunk(chunk_count=cat.working_memory['ccat-dietician']['chunk_count']))
+                        doc_by_hash.chunks.append(Chunk(chunk_count=cat.working_memory.ccat_dietician['chunk_count']))
                         session.add(doc_by_hash)
                         session.commit()
-                        log.info(f"Dietician detected {cat.working_memory['ccat-dietician']['name']} as a duplicate of {doc_by_hash.name}, since the number of chunks ({cat.working_memory['ccat-dietician']['chunk_count']}) produced now is different from what is already in declarative memory, this ingestion is going to be allowed.")
+                        log.info(f"Dietician detected {cat.working_memory.ccat_dietician['name']} as a duplicate of {doc_by_hash.name}, since the number of chunks ({cat.working_memory.ccat_dietician['chunk_count']}) produced now is different from what is already in declarative memory, this ingestion is going to be allowed.")
                         return docs
             else:
-                if cat.working_memory['ccat-dietician']['hash'] == doc_by_name.hash:
-                    if cat.working_memory['ccat-dietician']['chunk_count'] in [c.chunk_count for c in doc_by_name.chunks]:
-                        log.info(f"Dietician detected that {doc_by_name.name} was already ingested, since the number of chunks ({cat.working_memory['ccat-dietician']['chunk_count']}) coincides to what is already in declarative memory, this ingestion is going to be avoided.")
+                if cat.working_memory.ccat_dietician['hash'] == doc_by_name.hash:
+                    if cat.working_memory.ccat_dietician['chunk_count'] in [c.chunk_count for c in doc_by_name.chunks]:
+                        log.info(f"Dietician detected that {doc_by_name.name} was already ingested, since the number of chunks ({cat.working_memory.ccat_dietician['chunk_count']}) coincides to what is already in declarative memory, this ingestion is going to be avoided.")
                         return []
                     else:
-                        doc_by_name.chunks.append(Chunk(chunk_count=cat.working_memory['ccat-dietician']['chunk_count']))
+                        doc_by_name.chunks.append(Chunk(chunk_count=cat.working_memory.ccat_dietician['chunk_count']))
                         session.add(doc_by_name)
                         session.commit()
-                        log.info(f"Dietician detected that {doc_by_name.name} was already ingested, since the number of chunks ({cat.working_memory['ccat-dietician']['chunk_count']}) produced now is different from what is already in declarative memory, this ingestion is going to be allowed.")
+                        log.info(f"Dietician detected that {doc_by_name.name} was already ingested, since the number of chunks ({cat.working_memory.ccat_dietician['chunk_count']}) produced now is different from what is already in declarative memory, this ingestion is going to be allowed.")
                         return docs
                 else:
                     old_chunks, _ = cat.memory.vectors.declarative.client.scroll(
@@ -135,6 +209,6 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
 
         except Exception as e:
             session.rollback()
-            log.error(f"Something weird happened: {str(e)}. Dietician is preventing the ingestion of {cat.working_memory['ccat-dietician']['name']}")
+            log.error(f"Something weird happened: {str(e)}. Dietician is preventing the ingestion of {cat.working_memory.ccat_dietician['name']}")
             return []
 
