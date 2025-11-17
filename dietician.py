@@ -4,13 +4,9 @@ import json
 from typing import List
 from cat.log import log
 from cat.mad_hatter.decorators import hook, plugin
-from pydantic import BaseModel, Field
 from langchain.docstore.document import Document
 from sqlalchemy import ForeignKey, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session
-
-
-DEFAULT_SQLITE_FILEPATH = 'sqlite:///cat/data/dietician.db'
 
 
 class Base(DeclarativeBase):
@@ -46,91 +42,6 @@ class Chunk(Base):
 engine = None
 # Base.metadata.create_all(engine, checkfirst=True)
 # log.warning(f"Dietician is using a sqlite file located here: {DEFAULT_SQLITE_FILEPATH}. You can change the path in the plugin settings.")
-
-
-
-class PluginSettings(BaseModel):
-    sqlite_db_path: str = Field(
-        default=DEFAULT_SQLITE_FILEPATH,
-        title="Sqlite filepath. Change it only if you know what you are doing!",
-    )
-    delete_db: bool = Field(
-        default=False,
-        title="Delete Database",
-        description="Set to True to delete the database file. This action cannot be undone.",
-    )
-
-
-@plugin
-def settings_model():
-    return PluginSettings
-
-
-def save_plugin_settings_to_file(settings: dict, plugin_path: str) -> dict:
-    """
-    Save plugin settings to settings.json file in the plugin directory.
-    This replicates the default save behavior from the Cat framework.
-    
-    Args:
-        settings: The settings dictionary to save
-        plugin_path: The path to the plugin directory
-        
-    Returns:
-        The updated settings dictionary, or empty dict if save failed
-    """
-    settings_file_path = os.path.join(plugin_path, "settings.json")
-    
-    # Load already saved settings (replicate load_settings behavior)
-    old_settings = {}
-    if os.path.exists(settings_file_path):
-        try:
-            with open(settings_file_path, "r") as json_file:
-                old_settings = json.load(json_file)
-        except Exception as e:
-            log.error(f"Unable to load existing settings: {e}")
-    
-    # Merge new settings with old ones
-    updated_settings = {**old_settings, **settings}
-    
-    # Save settings to file
-    try:
-        with open(settings_file_path, "w") as json_file:
-            json.dump(updated_settings, json_file, indent=4)
-        return updated_settings
-    except Exception as e:
-        log.error(f"Unable to save plugin settings: {e}")
-        return {}
-
-
-@plugin
-def save_settings(settings):
-    """Handle plugin settings save with optional database deletion."""
-    delete_db = settings.get("delete_db", False)
-    
-    if delete_db:
-        db_path = settings.get("sqlite_db_path", DEFAULT_SQLITE_FILEPATH)
-        
-        # Extract file path from SQLAlchemy connection string
-        if db_path.startswith("sqlite:///"):
-            file_path = db_path[10:]  # Remove "sqlite:///" prefix
-        else:
-            file_path = db_path
-            
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                log.info(f"Dietician: Successfully deleted database file: {file_path}")
-            else:
-                log.warning(f"Dietician: Database file does not exist: {file_path}")
-        except Exception as e:
-            log.error(f"Dietician: Failed to delete database file {file_path}: {str(e)}")
-        
-        # Reset the delete_db flag to False after attempting deletion
-        settings["delete_db"] = False
-    
-    # Save settings using the extracted function (replicates default Cat behavior)
-    plugin_path = os.path.dirname(os.path.abspath(__file__))
-    return save_plugin_settings_to_file(settings, plugin_path)
 
 
 @hook(priority=10)
@@ -195,7 +106,7 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
                     )
                     old_chunks_text = [c.payload['page_content'] for c in old_chunks]
                     new_chunks_text = [d.page_content for d in docs]
-
+                    
                     # we have to delete all chunks in declarative memory that are not in the new document because those chunks are related an old version of the document
                     old_chunks_to_delete_ids = [c.id for c in old_chunks if c.payload['page_content'] not in new_chunks_text]
 
@@ -212,3 +123,163 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
             log.error(f"Something weird happened: {str(e)}. Dietician is preventing the ingestion of {cat.working_memory.ccat_dietician['name']}")
             return []
 
+
+def remove_documents_by_metadata(cat, metadata_filter: dict, exclude_metadata: dict = None) -> dict:
+    """
+    Generic function to remove documents from both dietician database and vector memory
+    based on metadata filtering.
+    
+    Args:
+        cat: The StrayCat instance
+        metadata_filter: Dictionary of metadata key-value pairs to match for removal
+        exclude_metadata: Optional dictionary of metadata to exclude from removal
+        
+    Returns:
+        dict: Summary of removal operations with counts and details
+    """
+    global engine
+    
+    if engine is None:
+        db_filepath = cat.mad_hatter.get_plugin().load_settings()["sqlite_db_path"]
+        engine = create_engine(db_filepath)
+        Base.metadata.create_all(engine, checkfirst=True)
+    
+    removed_count = 0
+    vector_removed_count = 0
+    errors = []
+    removed_urls = []
+    
+    try:
+        # Find chunks in vector memory that match the filter criteria
+        all_chunks, _ = cat.memory.vectors.declarative.client.scroll(
+            collection_name=cat.memory.vectors.declarative.collection_name,
+            scroll_filter=cat.memory.vectors.declarative._qdrant_filter_from_dict(metadata_filter),
+            with_payload=True
+        )
+        
+        chunks_to_remove = []
+        urls_to_remove_from_db = set()
+        
+        for chunk in all_chunks:
+            should_remove = True
+            
+            # Check if chunk should be excluded based on exclude_metadata
+            if exclude_metadata:
+                for key, value in exclude_metadata.items():
+                    chunk_value = chunk.payload.get(key)
+                    if chunk_value == value:
+                        should_remove = False
+                        break
+            
+            if should_remove:
+                chunks_to_remove.append(chunk.id)
+                chunk_source = chunk.payload.get('source')
+                if chunk_source:
+                    urls_to_remove_from_db.add(chunk_source)
+                    if chunk_source not in removed_urls:
+                        removed_urls.append(chunk_source)
+        
+        # Remove chunks from vector memory
+        if chunks_to_remove:
+            cat.memory.vectors.declarative.delete_points(chunks_to_remove)
+            vector_removed_count = len(chunks_to_remove)
+            log.info(f"Removed {vector_removed_count} chunks from vector memory based on metadata filter")
+        
+        # Remove corresponding documents from dietician database
+        with Session(engine) as session:
+            for url in urls_to_remove_from_db:
+                try:
+                    doc_to_remove = session.query(DietDocument).filter_by(name=url).first()
+                    if doc_to_remove:
+                        session.delete(doc_to_remove)
+                        removed_count += 1
+                        log.info(f"Removed document from dietician database: {url}")
+                except Exception as e:
+                    error_msg = f"Error removing document {url} from database: {str(e)}"
+                    log.error(error_msg)
+                    errors.append(error_msg)
+            
+            # Commit all database changes
+            session.commit()
+            
+    except Exception as e:
+        error_msg = f"Metadata-based cleanup operation failed: {str(e)}"
+        log.error(error_msg)
+        errors.append(error_msg)
+    
+    result = {
+        "removed_count": removed_count,
+        "vector_removed_count": vector_removed_count,
+        "removed_urls": removed_urls,
+        "errors": errors
+    }
+    
+    log.info(f"Metadata-based cleanup completed: {result}")
+    return result
+
+
+def save_plugin_settings_to_file(settings: dict, plugin_path: str) -> dict:
+    """
+    Save plugin settings to settings.json file in the plugin directory.
+    This replicates the default save behavior from the Cat framework.
+    
+    Args:
+        settings: The settings dictionary to save
+        plugin_path: The path to the plugin directory
+        
+    Returns:
+        The updated settings dictionary, or empty dict if save failed
+    """
+    settings_file_path = os.path.join(plugin_path, "settings.json")
+    
+    # Load already saved settings (replicate load_settings behavior)
+    old_settings = {}
+    if os.path.exists(settings_file_path):
+        try:
+            with open(settings_file_path, "r") as json_file:
+                old_settings = json.load(json_file)
+        except Exception as e:
+            log.error(f"Unable to load existing settings: {e}")
+    
+    # Merge new settings with old ones
+    updated_settings = {**old_settings, **settings}
+    
+    # Save settings to file
+    try:
+        with open(settings_file_path, "w") as json_file:
+            json.dump(updated_settings, json_file, indent=4)
+        return updated_settings
+    except Exception as e:
+        log.error(f"Unable to save plugin settings: {e}")
+        return {}
+
+
+@plugin
+def save_settings(settings):
+    """Handle plugin settings save with optional database deletion."""
+    delete_db = settings.get("delete_db", False)
+    
+    if delete_db:
+        db_path = settings.get("sqlite_db_path", "sqlite:///cat/data/dietician.db")
+        
+        # Extract file path from SQLAlchemy connection string
+        if db_path.startswith("sqlite:///"):
+            file_path = db_path[10:]  # Remove "sqlite:///" prefix
+        else:
+            file_path = db_path
+            
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                log.info(f"Dietician: Successfully deleted database file: {file_path}")
+            else:
+                log.warning(f"Dietician: Database file does not exist: {file_path}")
+        except Exception as e:
+            log.error(f"Dietician: Failed to delete database file {file_path}: {str(e)}")
+        
+        # Reset the delete_db flag to False after attempting deletion
+        settings["delete_db"] = False
+    
+    # Save settings using the extracted function (replicates default Cat behavior)
+    plugin_path = os.path.dirname(os.path.abspath(__file__))
+    return save_plugin_settings_to_file(settings, plugin_path)
