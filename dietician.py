@@ -19,7 +19,7 @@ class DietDocument(Base):
     name: Mapped[str] = mapped_column(String(256), unique=True)
     hash: Mapped[str] = mapped_column(String(64), unique=True)
     
-    chunks: Mapped[List["Chunk"]] = relationship(back_populates="document")
+    chunks: Mapped[List["Chunk"]] = relationship(back_populates="document", cascade="all, delete-orphan")
 
 
     def __repr__(self) -> str:
@@ -124,7 +124,7 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
             return []
 
 
-def remove_documents_by_metadata(cat, metadata_filter: dict, exclude_metadata: dict = None) -> dict:
+def remove_documents_by_metadata(cat, metadata_filter: dict, exclude_metadata: dict = None, exclude_sources: list = None) -> dict:
     """
     Generic function to remove documents from both dietician database and vector memory
     based on metadata filtering.
@@ -133,6 +133,7 @@ def remove_documents_by_metadata(cat, metadata_filter: dict, exclude_metadata: d
         cat: The StrayCat instance
         metadata_filter: Dictionary of metadata key-value pairs to match for removal
         exclude_metadata: Optional dictionary of metadata to exclude from removal
+        exclude_sources: Optional list of source URLs to exclude from removal (for pages that were scraped but not re-ingested)
         
     Returns:
         dict: Summary of removal operations with counts and details
@@ -163,21 +164,31 @@ def remove_documents_by_metadata(cat, metadata_filter: dict, exclude_metadata: d
         for chunk in all_chunks:
             should_remove = True
             
+            # Get metadata from chunk payload (it's nested under 'metadata' key)
+            chunk_metadata = chunk.payload.get('metadata', {})
+            chunk_source = chunk_metadata.get('source')
+            
+            # Check if source is in the exclude_sources list (pages that were scraped, even if not re-ingested)
+            if exclude_sources and chunk_source in exclude_sources:
+                should_remove = False
+                log.debug(f"Chunk {chunk.id} excluded from removal - source {chunk_source} is in scraped pages list")
+            
             # Check if chunk should be excluded based on exclude_metadata
-            if exclude_metadata:
+            if should_remove and exclude_metadata:
                 for key, value in exclude_metadata.items():
-                    chunk_value = chunk.payload.get(key)
+                    chunk_value = chunk_metadata.get(key)
                     if chunk_value == value:
                         should_remove = False
+                        log.debug(f"Chunk {chunk.id} excluded from removal - {key}={chunk_value} matches exclude filter")
                         break
             
             if should_remove:
                 chunks_to_remove.append(chunk.id)
-                chunk_source = chunk.payload.get('source')
                 if chunk_source:
                     urls_to_remove_from_db.add(chunk_source)
                     if chunk_source not in removed_urls:
                         removed_urls.append(chunk_source)
+                log.debug(f"Chunk {chunk.id} marked for removal - source: {chunk_source}, metadata: {chunk_metadata}")
         
         # Remove chunks from vector memory
         if chunks_to_remove:
@@ -191,9 +202,13 @@ def remove_documents_by_metadata(cat, metadata_filter: dict, exclude_metadata: d
                 try:
                     doc_to_remove = session.query(DietDocument).filter_by(name=url).first()
                     if doc_to_remove:
+                        # Delete all associated chunks first to avoid foreign key constraint issues
+                        for chunk in doc_to_remove.chunks:
+                            session.delete(chunk)
+                        # Now delete the document
                         session.delete(doc_to_remove)
                         removed_count += 1
-                        log.info(f"Removed document from dietician database: {url}")
+                        log.info(f"Removed document and its chunks from dietician database: {url}")
                 except Exception as e:
                     error_msg = f"Error removing document {url} from database: {str(e)}"
                     log.error(error_msg)
