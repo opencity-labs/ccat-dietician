@@ -7,6 +7,7 @@ from cat.mad_hatter.decorators import hook, plugin
 from langchain.docstore.document import Document
 from sqlalchemy import ForeignKey, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session
+from cat.looking_glass.stray_cat import StrayCat
 
 
 class Base(DeclarativeBase):
@@ -56,7 +57,7 @@ def before_rabbithole_splits_text(doc, cat):
     db_filepath = cat.mad_hatter.get_plugin().load_settings()["sqlite_db_path"]
     engine = create_engine(db_filepath)
     Base.metadata.create_all(engine, checkfirst=True)
-    log.warning(f"Dietician is writing on the sqlite db located here: {db_filepath}. You can change the path in the plugin settings.")
+    log.debug(f"Dietician is writing on the sqlite db located here: {db_filepath}. You can change the path in the plugin settings.")
 
 
     return doc
@@ -124,7 +125,7 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
             return []
 
 
-def remove_documents_by_metadata(cat, metadata_filter: dict, exclude_metadata: dict = None, exclude_sources: list = None) -> dict:
+def remove_documents_by_metadata(cat, metadata_filter: dict, exclude_metadata: dict = None, exclude_sources: list = None, qdrant_limit: int = 10000) -> dict:
     """
     Generic function to remove documents from both dietician database and vector memory
     based on metadata filtering.
@@ -155,7 +156,8 @@ def remove_documents_by_metadata(cat, metadata_filter: dict, exclude_metadata: d
         all_chunks, _ = cat.memory.vectors.declarative.client.scroll(
             collection_name=cat.memory.vectors.declarative.collection_name,
             scroll_filter=cat.memory.vectors.declarative._qdrant_filter_from_dict(metadata_filter),
-            with_payload=True
+            with_payload=True,
+            limit=qdrant_limit
         )
         
         chunks_to_remove = []
