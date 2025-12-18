@@ -47,3 +47,42 @@ If you wipe the declarative memory, you can now use the plugin settings to delet
 ## Under the hood
 
 ![Diagram flow](./img/ccat-dietician.png)
+
+## Log Schema
+
+This plugin uses structured JSON logging to facilitate monitoring and debugging. All logs follow this base structure:
+
+```json
+{
+  "component": "ccat_dietician",
+  "event": "<event_name>",
+  "data": {
+    ... <event_specific_data>
+  }
+}
+```
+
+### Event Types
+
+| Event Name | Description | Data Fields |
+|------------|-------------|-------------|
+| `db_init` | Logged when the database is initialized | `db_path` |
+| `ingestion_new` | Logged when a new document is allowed for ingestion | `source`, `chunk_count` |
+| `ingestion_duplicate` | Logged when a duplicate document is skipped | `source`, `original_source` |
+| `ingestion_rechunk` | Logged when a document is re-chunked | `source`, `chunk_count`, `original_source` |
+| `ingestion_unchanged` | Logged when a document is unchanged | `source` |
+| `ingestion_update` | Logged when a document is updated | `source`, `new_chunks_count`, `deleted_chunks_count` |
+| `ingestion_update_skipped` | Logged when a document has changed hash but chunks exist | `source` |
+| `ingestion_error` | Logged when an error occurs during ingestion check | `source`, `error` |
+| `cleanup_vector_removed` | Logged when chunks are removed from vector memory | `count` |
+| `cleanup_db_removed` | Logged when a document is removed from the database | `url` |
+| `cleanup_db_error` | Logged when an error occurs removing from DB | `url`, `error` |
+| `cleanup_error` | Logged when a general cleanup error occurs | `error` |
+| `cleanup_complete` | Logged when cleanup is complete | `removed_count`, `vector_removed_count`, `removed_urls`, `errors` |
+| `check_update_warning` | Logged when checking update status without hash | `url` |
+| `check_update_error` | Logged when checking update status fails | `url`, `error` |
+| `settings_load_error` | Logged when loading settings fails | `error` |
+| `settings_save_error` | Logged when saving settings fails | `error` |
+| `db_delete_success` | Logged when database is successfully deleted | `path` |
+| `db_delete_warning` | Logged when database file to delete is not found | `path` |
+| `db_delete_error` | Logged when deleting database fails | `path`, `error` |
