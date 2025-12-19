@@ -11,6 +11,11 @@ class PluginSettings(BaseModel):
         title="Delete Database",
         description="Set to True to delete the database file. This action cannot be undone.",
     )
+    optimize_pdf_check: bool = Field(
+        default=False,
+        title="Optimize PDF Check",
+        description="If True, PDF files with the same name as existing ones will be skipped without checking content hash.",
+    )
 
 @plugin
 def settings_model():

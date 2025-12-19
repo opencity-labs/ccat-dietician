@@ -66,13 +66,13 @@ def before_rabbithole_splits_text(doc, cat):
     db_filepath = cat.mad_hatter.get_plugin().load_settings()["sqlite_db_path"]
     engine = create_engine(db_filepath)
     Base.metadata.create_all(engine, checkfirst=True)
-    log.info(json.dumps({
-        "component": "ccat_dietician",
-        "event": "db_init",
-        "data": {
-            "db_path": db_filepath
-        }
-    }))
+    # log.debug(json.dumps({
+    #     "component": "ccat_dietician",
+    #     "event": "db_init",
+    #     "data": {
+    #         "db_path": db_filepath
+    #     }
+    # }))
 
     return doc
 
@@ -396,6 +396,25 @@ def check_should_update(url: str, cat, provided_hash: str = None) -> bool:
         db_filepath = cat.mad_hatter.get_plugin().load_settings()["sqlite_db_path"]
         engine = create_engine(db_filepath)
         Base.metadata.create_all(engine, checkfirst=True)
+
+    # Check for PDF optimization
+    settings = cat.mad_hatter.get_plugin().load_settings()
+    if settings.get("optimize_pdf_check", False) and url.lower().endswith('.pdf'):
+        with Session(engine) as session:
+            try:
+                doc_by_name = session.query(DietDocument).filter_by(name=url).first()
+                if doc_by_name:
+                    # log.debug(f"Dietician check: {url} is PDF and exists (optimization enabled)")
+                    return False
+            except Exception as e:
+                log.error(json.dumps({
+                    "component": "ccat_dietician",
+                    "event": "check_update_error",
+                    "data": {
+                        "url": url,
+                        "error": str(e)
+                    }
+                }))
         
     # If hash is not provided, we can't check without fetching content
     # But this function is designed to be called with a hash computed during the check phase
