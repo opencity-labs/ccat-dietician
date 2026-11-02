@@ -43,6 +43,21 @@ If you wipe the declarative memory, you can now use the plugin settings to delet
 - `dietician.py` - Main plugin logic with document tracking and cleanup functions
 - `settings.py` - Plugin configuration settings
 - `settings.json` - Saved plugin settings (auto-generated)
+- `tests/` - Regression tests (not needed at runtime)
+
+## Known limitations
+
+- **Hash conflict**: the `hash` column is unique. If a changed document becomes identical to another already tracked document, its vector memory is updated but the old hash is kept (event `hash_conflict`). While the conflict lasts the document is seen as "changed" at every run: `check_should_update()` returns `True` and its points are scrolled again. Nothing is re-embedded or duplicated, it's only repeated work.
+- **Embedding failures**: the hash is stored before the Cat embeds the new chunks. If the embedding fails after the hook, the document is considered up to date until its content changes again.
+
+## Tests
+
+Regression tests for the update logic run against an in-memory Qdrant and a temporary SQLite database, with a stub of the Cat:
+
+```bash
+pip install -r tests/requirements.txt
+python -m unittest discover -s tests -v
+```
 
 ## Under the hood
 
@@ -73,6 +88,8 @@ This plugin uses structured JSON logging to facilitate monitoring and debugging.
 | `ingestion_unchanged` | Logged when a document is unchanged | `source` |
 | `ingestion_update` | Logged when a document is updated | `source`, `new_chunks_count`, `deleted_chunks_count` |
 | `ingestion_update_skipped` | Logged when a document has changed hash but chunks exist | `source` |
+| `hash_conflict` | Logged when a changed document now has the same content (hash) of another document: the old hash is kept, see [Known limitations](#known-limitations) | `source`, `hash_owner` |
+| `cleanup_duplicates_removed` | Logged when duplicated chunks (same `page_content` stored more than once for the same source) are removed during an update | `source`, `count` |
 | `ingestion_error` | Logged when an error occurs during ingestion check | `source`, `error` |
 | `cleanup_vector_removed` | Logged when chunks are removed from vector memory | `count` |
 | `cleanup_db_removed` | Logged when a document is removed from the database | `url` |

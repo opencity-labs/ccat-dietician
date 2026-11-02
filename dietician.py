@@ -168,23 +168,86 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
                         }))
                         return docs
                 else:
-                    old_chunks, _ = cat.memory.vectors.declarative.client.scroll(
-                        collection_name=cat.memory.vectors.declarative.collection_name,
-                        scroll_filter=cat.memory.vectors.declarative._qdrant_filter_from_dict({'source': doc_by_name.name}),
-                        with_payload=True
-                    )
-                    old_chunks_text = [c.payload['page_content'] for c in old_chunks]
-                    new_chunks_text = [d.page_content for d in docs]
-                    
-                    # we have to delete all chunks in declarative memory that are not in the new document because those chunks are related an old version of the document
-                    old_chunks_to_delete_ids = [c.id for c in old_chunks if c.payload['page_content'] not in new_chunks_text]
+                    # Read ALL the points of this source: without pagination qdrant returns
+                    # only the first 10, so the chunks beyond the 10th were re-embedded at
+                    # every run and the old ones were never deleted (growing duplicates).
+                    old_chunks = _scroll_all_points(cat, {'source': doc_by_name.name})
+                    old_chunks_text = set(c.payload['page_content'] for c in old_chunks)
+                    new_chunks_text = set(d.page_content for d in docs)
+
+                    # we have to delete all chunks in declarative memory that are not in the new document because those chunks are related an old version of the document.
+                    # We also delete exact duplicates (same page_content stored more than once), keeping a single copy.
+                    old_chunks_to_delete_ids = []
+                    kept_texts = set()
+                    duplicated_count = 0
+                    for c in old_chunks:
+                        text = c.payload['page_content']
+                        if text not in new_chunks_text:
+                            old_chunks_to_delete_ids.append(c.id)
+                        elif text in kept_texts:
+                            old_chunks_to_delete_ids.append(c.id)
+                            duplicated_count += 1
+                        else:
+                            kept_texts.add(text)
+
+                    # Update the stored hash, otherwise the document is seen as "changed" forever.
+                    # `hash` is UNIQUE: if another document already owns the new hash we cannot store it,
+                    # so we keep the old one instead of failing the commit (which would leave the vector memory
+                    # without the deleted chunks and without the new ones).
+                    # Known trade-off: while the conflict lasts the stored hash never matches, so at every run
+                    # check_should_update() returns True and this branch scrolls the whole source again.
+                    # Thanks to the dedup below nothing is re-embedded or duplicated, it's only repeated work.
+                    old_hash = doc_by_name.hash
+                    hash_owner = session.query(DietDocument).filter(
+                        DietDocument.hash == dietician_data['hash'],
+                        DietDocument.id != doc_by_name.id
+                    ).first()
+                    if hash_owner is None:
+                        doc_by_name.hash = dietician_data['hash']
+                    else:
+                        log.warning(json.dumps({
+                            "component": "ccat_dietician",
+                            "event": "hash_conflict",
+                            "data": {
+                                "source": doc_by_name.name,
+                                "hash_owner": hash_owner.name
+                            }
+                        }))
+                    # Clear old chunk records and add new chunk count (proper SQLAlchemy way)
+                    doc_by_name.chunks.clear()
+                    doc_by_name.chunks.append(Chunk(chunk_count=dietician_data['chunk_count']))
+                    session.commit()
 
                     if len(old_chunks_to_delete_ids) > 0:
-                        cat.memory.vectors.declarative.delete_points(old_chunks_to_delete_ids)
+                        try:
+                            cat.memory.vectors.declarative.delete_points(old_chunks_to_delete_ids)
+                        except Exception:
+                            # The new hash is already committed: if the vector memory was not updated,
+                            # restore the old hash so the document is reprocessed at the next run
+                            # instead of being seen as "unchanged" with stale chunks forever.
+                            doc_by_name.hash = old_hash
+                            session.commit()
+                            raise
 
-                    # docs contain only chunks never inserted in declarative memory, we keep into the vectordb any chunk previously inserted (to avoid unnecessary calls to the embedding model)
-                    new_chunks_to_ingest = [d for d in docs if d.page_content not in old_chunks_text]
-                    
+                    # docs contain only chunks never inserted in declarative memory, we keep into the vectordb any chunk previously inserted (to avoid unnecessary calls to the embedding model).
+                    # Chunks repeated inside the new document are ingested only once.
+                    new_chunks_to_ingest = []
+                    queued_texts = set()
+                    for d in docs:
+                        if d.page_content not in old_chunks_text and d.page_content not in queued_texts:
+                            new_chunks_to_ingest.append(d)
+                            queued_texts.add(d.page_content)
+
+                    if duplicated_count > 0:
+                        log.info(json.dumps({
+                            "component": "ccat_dietician",
+                            "event": "cleanup_duplicates_removed",
+                            "data": {
+                                "source": doc_by_name.name,
+                                "count": duplicated_count
+                            }
+                        }))
+
                     if len(new_chunks_to_ingest) > 0:
                         log.info(json.dumps({
                             "component": "ccat_dietician",
@@ -195,12 +258,6 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
                                 "deleted_chunks_count": len(old_chunks_to_delete_ids)
                             }
                         }))
-                        # Update hash and chunk count in database
-                        doc_by_name.hash = dietician_data['hash']
-                        # Clear old chunk records and add new chunk count (proper SQLAlchemy way)
-                        doc_by_name.chunks.clear()
-                        doc_by_name.chunks.append(Chunk(chunk_count=dietician_data['chunk_count']))
-                        session.commit()
                     else:
                         log.info(json.dumps({
                             "component": "ccat_dietician",
@@ -218,12 +275,7 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
                                     "count": len(old_chunks_to_delete_ids)
                                 }
                             }))
-                        # Update hash in database even if no new chunks (hash changed, so update it)
-                        doc_by_name.hash = dietician_data['hash']
-                        doc_by_name.chunks.clear()
-                        doc_by_name.chunks.append(Chunk(chunk_count=dietician_data['chunk_count']))
-                        session.commit()
-                    
+
                     return new_chunks_to_ingest
 
         except Exception as e:
@@ -237,6 +289,26 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
                 }
             }))
             return []
+
+
+def _scroll_all_points(cat, metadata_filter: dict, page_size: int = 256) -> list:
+    """Return all the declarative memory points matching metadata_filter, following qdrant pagination."""
+    declarative = cat.memory.vectors.declarative
+    points = []
+    offset = None
+    while True:
+        page, offset = declarative.client.scroll(
+            collection_name=declarative.collection_name,
+            scroll_filter=declarative._qdrant_filter_from_dict(metadata_filter),
+            with_payload=True,
+            with_vectors=False,
+            limit=page_size,
+            offset=offset
+        )
+        points.extend(page)
+        if offset is None:
+            break
+    return points
 
 
 def remove_documents_by_metadata(cat, metadata_filter: dict, exclude_metadata: dict = None, exclude_sources: list = None, qdrant_limit: int = 10000) -> dict:
@@ -267,12 +339,8 @@ def remove_documents_by_metadata(cat, metadata_filter: dict, exclude_metadata: d
     
     try:
         # Find chunks in vector memory that match the filter criteria
-        all_chunks, _ = cat.memory.vectors.declarative.client.scroll(
-            collection_name=cat.memory.vectors.declarative.collection_name,
-            scroll_filter=cat.memory.vectors.declarative._qdrant_filter_from_dict(metadata_filter),
-            with_payload=True,
-            limit=qdrant_limit
-        )
+        # qdrant_limit is now the page size: all the matching points are read, following pagination
+        all_chunks = _scroll_all_points(cat, metadata_filter, page_size=qdrant_limit)
         
         chunks_to_remove = []
         urls_to_remove_from_db = set()
